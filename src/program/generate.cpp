@@ -13609,6 +13609,19 @@ int main(int argc, char** argv) {
                         if (strata::core::conversation_memory_admit(
                                 mem ? std::optional<uint64_t>(mem->available) : std::nullopt, need, floor))
                             return true;
+                        // the same reclamation the parking gate tries before it refuses: memory freed earlier can
+                        // still sit in the C library's heap, which /proc/meminfo does not count as available, and
+                        // the park pools' idle bytes are the cheapest RAM to hand back. A disk read is held only
+                        // until it is uploaded to the GPUs, so giving these up here costs nothing a restore needs.
+                        auto recheck = [&]() {
+                            const auto m2 = strata::core::sample_host_memory();
+                            return m2 && strata::core::conversation_memory_admit(std::optional<uint64_t>(m2->available), need, floor);
+                        };
+                        if (pools_budget.idle_bytes() > 0) {
+                            pools_budget.shrink((size_t) -1);
+                            if (recheck()) return true;
+                        }
+                        if (strata::core::release_free_heap() && recheck()) return true;
                         if (n == conversations.slots() || !conversations.evict_oldest()) {
                             why = "not enough RAM to read it (" + std::to_string(need >> 20) + " MiB plus a floor of " +
                                   std::to_string((long long) floor_mib) + " MiB, " +
