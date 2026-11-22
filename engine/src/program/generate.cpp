@@ -19457,12 +19457,66 @@ int main(int argc, char** argv) {
                         strata::core::SessionReadLimits limits;
                         const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib << 20;
                         pools_budget.shrink((size_t) -1);
-                        limits.admit = [floor, &o](uint64_t need, std::string& w) {
-                            const auto mem = strata::core::sample_host_memory();
-                            if (strata::core::conversation_memory_admit(mem ? std::optional<uint64_t>(mem->available) : std::nullopt,
-                                                                        need, floor)) return true;
+                        // The tier read is the same physical-RAM admission as the parking gate above, so it needs the
+                        // same rescue. Shrinking the park pools once is not enough: freed memory can stay in the C
+                        // library's heap, which /proc/meminfo does not count, and an evicted parked conversation only
+                        // gives its RAM back once the spill writer has written it and its bytes are reclaimed. Without
+                        // the drain the eviction returns nothing measurable and the gate refuses anyway (measured:
+                        // a 231,849-token conversation re-read from token 0, 125.6 s).
+                        limits.admit = [&](uint64_t need, std::string& w) {
+                            std::optional<strata::core::HostMemoryReading> mem;
+                            auto fits_now = [&]() {
+                                mem = strata::core::sample_host_memory();
+                                return strata::core::conversation_memory_admit(
+                                    mem ? std::optional<uint64_t>(mem->available) : std::nullopt, need, floor);
+                            };
+                            bool fits = fits_now();
+                            size_t evicted = 0;
+                            std::string rescue_note;
+                            if (!fits) {
+                                // (STRATA_PARK_SEGPOOL_MIB: the pool's idle bytes are the first RAM to go back,
+                                //  before the heap and before any parked conversation, as in the parking gate)
+                                if (pools_budget.idle_bytes() > 0) {
+                                    pools_budget.shrink((size_t) -1);
+                                    fits = fits_now();
+                                }
+                                if (!fits) fits = (strata::core::release_free_heap() && fits_now());
+                                if (!fits) {
+                                    const strata::core::EvictForRam r = strata::core::evict_for_ram(
+                                        fits_now, [&] { return mem ? std::optional<uint64_t>(mem->available) : std::nullopt; },
+                                        [&]() -> size_t {
+                                            const size_t b = conversations.oldest_evictable_bytes();
+                                            if (b == 0 || !conversations.evict_oldest()) return 0;
+                                            if (spill_writer) {   // (2c: the victim went to the background writer: its memory is back once written)
+                                                spill_writer->wait_idle();
+                                                spill_reclaim();
+                                            }
+                                            if (pools_budget.idle_bytes() > 0) pools_budget.shrink((size_t) -1);
+                                            return b;
+                                        },
+                                        conversations.slots(),
+                                        // #2253: short by more than every parked conversation that may go holds: none is evicted
+                                        need > UINT64_MAX - floor ? UINT64_MAX : need + floor,
+                                        (uint64_t) conversations.evictable_bytes());
+                                    fits = r.fits;
+                                    evicted = r.evicted;
+                                    if (r.cannot_help) {
+                                        char note[160];
+                                        std::snprintf(note, sizeof note, "; short by %llu MiB, more than the %zu parked hold (%zu MiB), so none was evicted",
+                                                      (unsigned long long) (r.short_by >> 20), conversations.size(), conversations.evictable_bytes() >> 20);
+                                        rescue_note = note;
+                                    }
+                                }
+                            }
+                            if (fits) {
+                                if (evicted)
+                                    std::fprintf(stderr, "strata serve: conversation cache: evicted %zu parked conversation%s to read this one back from the SSD tier (%zu MiB plus %lld MiB floor)\n",
+                                                 evicted, evicted == 1 ? "" : "s", need >> 20,
+                                                 (long long) o.conversation_cache_min_free_mib);
+                                return true;
+                            }
                             w = "not enough RAM to read it (" + std::to_string(need >> 20) + " MiB plus a floor of " +
-                                std::to_string((long long) o.conversation_cache_min_free_mib) + " MiB needed, " + ram_note(mem) + ")";
+                                std::to_string((long long) o.conversation_cache_min_free_mib) + " MiB needed, " + ram_note(mem) + rescue_note + ")";
                             return false;
                         };
                         if (strata::core::conversation_session_read_limits(limits, ss, g, use_mtp ? &mtp.kv_state() : nullptr,
