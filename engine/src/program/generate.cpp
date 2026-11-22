@@ -19479,8 +19479,12 @@ int main(int argc, char** argv) {
                                 if (pools_budget.idle_bytes() > 0) {
                                     pools_budget.shrink((size_t) -1);
                                     fits = fits_now();
+                                    if (fits) std::fprintf(stderr, "strata serve: tier read admitted after pool shrink\n");
                                 }
-                                if (!fits) fits = (strata::core::release_free_heap() && fits_now());
+                                if (!fits) {
+                                    fits = (strata::core::release_free_heap() && fits_now());
+                                    if (fits) std::fprintf(stderr, "strata serve: tier read admitted after heap reclaim\n");
+                                }
                                 if (!fits) {
                                     const strata::core::EvictForRam r = strata::core::evict_for_ram(
                                         fits_now, [&] { return mem ? std::optional<uint64_t>(mem->available) : std::nullopt; },
